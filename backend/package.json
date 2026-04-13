@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
-    "dev1": "node index.js"
+    "dev1": "node index.js",
+    "test": "node tests/verification.test.js",
+    "worker:payment": "node workers/payment.worker.js",
+    "worker:outbox": "node workers/outbox.poller.js"
   },
   "author": "",
   "license": "ISC",

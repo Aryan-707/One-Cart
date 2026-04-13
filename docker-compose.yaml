@@ -23,6 +23,28 @@ services:
     networks:
       - onecart
 
+  payment-worker:
+    build: ./backend
+    container_name: payment-worker
+    command: node workers/payment.worker.js
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - rabbitmq
+    networks:
+      - onecart
+
+  outbox-poller:
+    build: ./backend
+    container_name: outbox-poller
+    command: node workers/outbox.poller.js
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - rabbitmq
+    networks:
+      - onecart
+
 
   
   backend:

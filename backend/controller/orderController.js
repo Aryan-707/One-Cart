@@ -1,6 +1,9 @@
  import Order from "../model/orderModel.js"
  import User from  "../model/userModel.js" 
+ import IdempotencyKey from "../model/idempotencyModel.js"
+ import OutboxEvent from "../model/outboxModel.js"
  import razorpay from "razorpay"
+ import crypto from "crypto"
  import dotenv from "dotenv"
  import { getChannel } from "../config/rabbitmq.js"
  dotenv.config()
@@ -12,12 +15,46 @@
 
 
  const currency="inr"
+
+ /**
+  * Generate a deterministic idempotency key from request data.
+  * Falls back to crypto.randomUUID() if no identifier is available.
+  */
+ const generateIdempotencyKey = (identifier) => {
+   if (!identifier) return crypto.randomUUID()
+   return crypto.createHash("sha256").update(identifier).digest("hex")
+ }
+
+ /**
+  * Check if an idempotency key has already been processed.
+  * Returns the cached response if found, null otherwise.
+  */
+ const checkIdempotency = async (key) => {
+   const existing = await IdempotencyKey.findOne({ key })
+   return existing
+ }
+
+ /**
+  * Store a processed idempotency key (auto-expires via TTL index after 24h).
+  */
+ const storeIdempotencyKey = async (key, statusCode, response) => {
+   await IdempotencyKey.create({ key, statusCode, response })
+ }
  
  export const placeOrder=async(req,res)=>{
     try{
         const {items,amount,address}=req.body
         console.log("place order called")
         const userId=req.userId
+
+        // ── Idempotency check ──
+        const idempotencyKey = req.headers["x-idempotency-key"] || generateIdempotencyKey(`${userId}-${Date.now()}`)
+        const cached = await checkIdempotency(idempotencyKey)
+        if (cached) {
+          console.log(`⚡ Idempotent hit for key: ${idempotencyKey}`)
+          return res.status(cached.statusCode).json(cached.response)
+        }
+
         const orderData={
             items,
             amount,
@@ -25,7 +62,8 @@
             address,
             paymentMethod:"COD",
             payment:false,
-            date:Date.now()
+            date:Date.now(),
+            idempotencyKey
         }
 
 
@@ -33,23 +71,40 @@
         await newOrder.save()
         await User.findByIdAndUpdate(userId,{cartData:{}})
 
+        // ── Outbox: insert event as PENDING ──
+        await OutboxEvent.create({
+          aggregateId: newOrder._id.toString(),
+          eventType: "ORDER_CREATED",
+          payload: {
+            orderId: newOrder._id,
+            userId: orderData.userId,
+            email: orderData.address.email,
+            amount: orderData.amount
+          },
+          status: "PENDING"
+        })
 
-        const channel = getChannel()
-      
-        const routingKey="order.created"
-        const exchange="order.direct"
+        // ── Publish to RabbitMQ (best-effort, outbox poller is the safety net) ──
+        try {
+          const channel = getChannel()
+          const routingKey="order.created"
+          const exchange="order.direct"
+           channel.publish(exchange,routingKey,Buffer.from(JSON.stringify({
+              orderId:newOrder._id,
+              userId:orderData.userId,
+              email:orderData.address.email,
+              amount:orderData.amount
+           })),{ persistent: true })
+        } catch (mqErr) {
+          console.warn("⚠️  RabbitMQ publish failed (outbox poller will retry):", mqErr.message)
+        }
 
-         
-         channel.publish(exchange,routingKey,Buffer.from(JSON.stringify({
-            orderId:newOrder._id,
-            userId:orderData.userId,
-            email:orderData.address.email,
-            amount:orderData.amount
+        const responseBody = { message: "Order Place", orderId: newOrder._id }
 
-         })),{ persistent: true })
-         
+        // ── Store idempotency key (24h TTL) ──
+        await storeIdempotencyKey(idempotencyKey, 201, responseBody)
 
-        return res.status(201).json({message:"Order Place"})
+        return res.status(201).json(responseBody)
 
     }catch(error){
         console.log(error)
@@ -104,6 +159,15 @@
     try{
         const {items,amount,address}=req.body
         const userId=req.userId
+
+        // ── Idempotency check ──
+        const idempotencyKey = req.headers["x-idempotency-key"] || generateIdempotencyKey(`razorpay-${userId}-${amount}-${Date.now()}`)
+        const cached = await checkIdempotency(idempotencyKey)
+        if (cached) {
+          console.log(`⚡ Idempotent hit for Razorpay order: ${idempotencyKey}`)
+          return res.status(cached.statusCode).json(cached.response)
+        }
+
         const orderData={
             items,
             amount,
@@ -111,7 +175,8 @@
             address,
             paymentMethod:"Razorpay",
             payment:false,
-            date:Date.now()
+            date:Date.now(),
+            idempotencyKey
         }
         const newOrder=new Order(orderData)
         await newOrder.save()
@@ -128,9 +193,11 @@
                 return res.status(500).json(error)
             }
             else{
-
+                // Store idempotency key
+                storeIdempotencyKey(idempotencyKey, 200, order).catch(err =>
+                  console.warn("Failed to store idempotency key:", err.message)
+                )
                 res.status(200).json(order)
-
             }
         })
 
@@ -144,31 +211,82 @@
     try{
         const userId=req.userId
         const {razorpay_order_id}=req.body
+
+        // ── Idempotency: derive key from razorpay_order_id (deterministic) ──
+        const idempotencyKey = generateIdempotencyKey(`verify-${razorpay_order_id}`)
+        const cached = await checkIdempotency(idempotencyKey)
+        if (cached) {
+          console.log(`⚡ Idempotent hit for verify: ${idempotencyKey}`)
+          return res.status(cached.statusCode).json(cached.response)
+        }
+
         const orderInfo=await razorpayInstance.orders.fetch(razorpay_order_id)
        
         if(orderInfo.status==="paid"){
              const orderId=orderInfo.receipt
+
+            // ── Outbox: insert PENDING event BEFORE processing ──
+            const outboxEvent = await OutboxEvent.create({
+              aggregateId: orderId,
+              eventType: "PAYMENT_VERIFIED",
+              payload: {
+                razorpay_order_id,
+                orderId,
+                userId
+              },
+              status: "PENDING"
+            })
+
             await User.findByIdAndUpdate(userId,{cartData:{}})
             const order = await Order.findByIdAndUpdate(orderId,{payment:true},{new:true})
 
-             const channel = getChannel()
-    const exchange = "order.direct"
-    const routingKey = "order.created"
+            // ── Publish to RabbitMQ (best-effort) ──
+            try {
+              const channel = getChannel()
+              const exchange = "order.direct"
+              const routingKey = "order.created"
 
-    channel.publish(
-      exchange,
-      routingKey,
-      Buffer.from(JSON.stringify({
-        orderId: order._id,
-        userId: order.userId,
-        email: order.address.email,
-        amount: order.amount
-      })),
-      { persistent: true }
-    )
+              channel.publish(
+                exchange,
+                routingKey,
+                Buffer.from(JSON.stringify({
+                  orderId: order._id,
+                  userId: order.userId,
+                  email: order.address.email,
+                  amount: order.amount
+                })),
+                { persistent: true }
+              )
 
-    
-            res.status(200).json({message:"Payment successfull"})
+              // Also publish to payment processing queue
+              channel.publish(
+                exchange,
+                "payment.process",
+                Buffer.from(JSON.stringify({
+                  orderId: order._id,
+                  razorpay_order_id,
+                  userId: order.userId,
+                  amount: order.amount,
+                  status: "paid"
+                })),
+                { persistent: true }
+              )
+            } catch (mqErr) {
+              console.warn("⚠️  RabbitMQ publish failed (outbox poller will retry):", mqErr.message)
+            }
+
+            // ── Mark outbox event as PROCESSED ──
+            await OutboxEvent.findByIdAndUpdate(outboxEvent._id, {
+              status: "PROCESSED",
+              processedAt: new Date()
+            })
+
+            const responseBody = { message: "Payment successfull" }
+
+            // ── Store idempotency key ──
+            await storeIdempotencyKey(idempotencyKey, 200, responseBody)
+
+            res.status(200).json(responseBody)
             
         }
         else{

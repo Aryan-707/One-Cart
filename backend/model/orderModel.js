@@ -32,9 +32,14 @@ const orderSchema=new mongoose.Schema({
     paymentMethod:{
         type:String,
         required:true
+    },
+    idempotencyKey:{
+        type:String,
+        unique:true,
+        sparse:true,
+        index:true
     }
 },{timeStamp:true})
 
 const Order=mongoose.model("Order",orderSchema)
 export default Order
-
